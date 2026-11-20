@@ -1,0 +1,9 @@
+# What sets podman-test apart for haskell-dev, the development loop of
+# https://github.com/jprupp/tools: `haskell-dev build`, `test` and `docs`.
+
+# The spec modules that take most of the time of the tests. Each of their
+# groups is run apart, so that the test processes share them evenly: each
+# group is one thing, with pods of its own.
+slow-specs = [
+  "Test.Podman",
+]

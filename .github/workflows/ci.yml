@@ -1,0 +1,19 @@
+name: CI
+
+# Built and tested twice with Stack, against the C libraries of Ubuntu and
+# with Nix, with the Haddock documentation, by the shared workflow of
+# jprupp/tools: .github/workflows/haskell-stack.yml there says more.
+#
+# The runners of GitHub have Podman, so the tests run their containers there
+# too. Where Podman cannot run, as it may not in the shell of Nix, the tests
+# that need it are pending, and say why.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  stack:
+    uses: jprupp/tools/.github/workflows/haskell-stack.yml@master

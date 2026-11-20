@@ -1,0 +1,317 @@
+# podman-test
+
+[![CI](https://github.com/jprupp/podman-test/actions/workflows/ci.yml/badge.svg)](https://github.com/jprupp/podman-test/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/jprupp/podman-test/blob/master/LICENSE)
+
+Podman containers for the tests of Haskell programs. The services that a test
+needs, such as a database, a cache or a node, run in rootless containers for
+as long as the test does, and the test reaches them through Unix sockets. Tests
+that run in parallel never meet, a container never outlives its test, and a
+test starts only once its services answer. It works with any test framework:
+it is plain `IO`, in the shape of `bracket`.
+
+- [Changelog](https://github.com/jprupp/podman-test/blob/master/CHANGELOG.md)
+- [Report a bug](https://github.com/jprupp/podman-test/issues)
+
+## Contents
+
+- [Why podman-test](#why-podman-test)
+- [Design](#design)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Endpoints](#endpoints)
+- [Pods of several containers](#pods-of-several-containers)
+- [Readiness](#readiness)
+- [Images](#images)
+- [Parallel runs and clean-up](#parallel-runs-and-clean-up)
+- [With hspec](#with-hspec)
+- [Requirements and limits](#requirements-and-limits)
+- [Troubleshooting](#troubleshooting)
+- [Module overview](#module-overview)
+- [Development](#development)
+- [License](#license)
+
+## Why podman-test
+
+A test of code that talks to a real service finds what a mock cannot: the
+protocol as the service speaks it, its errors, its timing. A container gives
+every test the same version of the service, on every machine. But a test needs
+more than `podman run`:
+
+- **The container must go away with the test**, also when the test fails, and
+  also when the test binary is killed.
+- **Tests that run at once must not meet.** Fixed ports collide, and random
+  ports collide too, now and then, and fail a test for no reason of its own.
+- **The test must wait until the service answers**, not until its container
+  has started.
+- **A failure must explain itself**: what the service printed is often the
+  only clue.
+
+[testcontainers](https://hackage.haskell.org/package/testcontainers) does much
+of this for Docker. This library is for Podman, rootless, with Unix sockets in
+place of ports, and with no helper container left running to clean up.
+
+## Design
+
+- **Unix sockets, not ports.** Each pod has a folder of its own on the host,
+  mounted into each of its containers at `/podman-test`, and each endpoint of a
+  service is a socket in it. Tests that run at once have folders of their own,
+  so their names never meet, and no port of the machine is taken. A pod whose
+  endpoints are all sockets has no network at all.
+- **A bridge for services that only speak TCP.** A small container of
+  [socat](http://www.dest-unreach.org/socat/) in the pod joins each connection
+  to a socket to the port of the service, which needs nothing installed.
+- **TCP where a client needs it.** A port can still be published on
+  `127.0.0.1`, on a port that Podman picks, for a client that only takes a host
+  and a port.
+- **The next run is the reaper.** Every pod carries the name of its run: the
+  process ID and the start time of its process. A run removes its pods when its
+  tests end, and the first pod of every run removes the pods of runs whose
+  process is gone. No container is left running to watch.
+- **Ready means ready.** A test gets its pod once every endpoint accepts
+  connections, or once whatever else you name holds.
+- **Pinned images.** An image of a registry is named by its digest; one built
+  from a recipe is tagged by the hash of the recipe. Eight processes that need
+  the same image pull or build it once.
+- **Safe defaults.** A container may use 512 MiB of memory unless you say
+  otherwise, every call to Podman has a deadline, and the logs of the
+  containers go to the standard error when something fails.
+
+## Installation
+
+Add it to the dependencies of your test suite:
+
+```yaml
+tests:
+  spec:
+    dependencies:
+      - podman-test
+```
+
+It needs Podman 4 or later, rootless, on Linux: see
+[Requirements and limits](#requirements-and-limits).
+
+## Quick start
+
+A Redis that listens on a socket of its pod, and a test that talks to it:
+
+```haskell
+import Control.Exception (bracket)
+import qualified Data.ByteString.Char8 as C
+import Network.Socket (close)
+import Network.Socket.ByteString (recv, sendAll)
+import Test.Podman
+
+redis :: ContainerSpec
+redis =
+  (container "redis" (Registry "docker.io/library/redis:7-alpine"))
+    { command =
+        [ "redis-server", "--port", "0", "--save", ""
+        , "--unixsocket", socketInside "redis", "--unixsocketperm", "777"
+        ]
+    , endpoints = [Native "redis"]
+    }
+
+main :: IO ()
+main = withContainer redis $ \p ->
+  bracket (connectTo (address p "redis")) close $ \s -> do
+    sendAll s (C.pack "PING\r\n")
+    recv s 64 >>= C.putStrLn
+```
+
+It prints `+PONG`. `withContainer` pulls the image if Podman does not have it,
+starts the container, waits until the socket accepts connections, runs the
+action, and removes the container, whatever the action does. In a real test,
+pin the image by its digest: see [Images](#images).
+
+## Endpoints
+
+An endpoint is how a test reaches a service, and its name names its socket.
+`address` gives where it is on the host:
+
+| Endpoint | The service | The test reaches it at |
+| --- | --- | --- |
+| `Native "db"` | listens on the socket `socketInside "db"`, which is `/podman-test/db.sock` | `UnixSocket` in the folder of the pod |
+| `Bridged "db" 5432` | listens on TCP port 5432 | `UnixSocket` in the folder of the pod, through the bridge |
+| `Published "db" 5432` | listens on TCP port 5432 | `TcpPort "127.0.0.1"` and a port that Podman picked |
+
+`connectTo` opens a socket to an `Address`, and `sockAddr` gives it as the
+`network` package takes it, for a client library that takes a `SockAddr`. A
+client that takes the path of a Unix socket, such as hedis, takes the
+`FilePath` of a `UnixSocket`.
+
+**Native** is the best when the service can do it: nothing stands between the
+test and the service. The service makes the socket as the user that it runs as
+in its container, which is not the user of the tests, so it has to make it open
+to everyone, as Redis does with `--unixsocketperm 777`.
+
+**Bridged** works with any service. The bridge runs as root of its container,
+which rootless Podman maps to the user of the tests, so the socket is theirs.
+
+**Published** is for clients that only take a host and a port. The pod then
+has a network, which it does not need otherwise.
+
+## Pods of several containers
+
+The containers of a pod share its network, so they reach each other on
+`localhost`, and its folder of sockets. A client next to a server:
+
+```haskell
+pair :: PodSpec
+pair =
+  (pod "pair" [server, client])
+    { ready = [Succeeds "client" ["redis-cli", "-h", "127.0.0.1", "ping"]] }
+  where
+    server = (container "server" redisImage) {command = ["redis-server", "--save", ""]}
+    client =
+      (container "client" redisImage)
+        { entrypoint = Just "sh", command = ["-c", "while :; do sleep 3600; done"] }
+```
+
+`exec p "client" [...]` runs a command in a container of the pod and gives what
+it printed, and `logs p "server"` gives the log of one. Without `outgoing =
+True`, a pod with sockets only has no network beyond itself, so a test cannot
+reach the Internet by mistake.
+
+## Readiness
+
+`withPod` gives the pod to the action once every `Readiness` of its spec holds,
+in their order, within `readyWithin` seconds, 60 by default. `pod` sets
+`ready` to `Accepts` for every endpoint.
+
+| Readiness | Holds when |
+| --- | --- |
+| `Accepts "db"` | the endpoint accepts a connection; for a port, from inside the pod, so that a bridge that accepts before the service listens does not count |
+| `LogLine "db" "ready to accept"` | the log of the container has the text |
+| `Succeeds "db" ["pg_isready"]` | the command succeeds in the container |
+| `Probe "the schema is loaded" check` | `check :: Pod -> IO Bool` says so |
+
+A container that stops before its pod is ready stops the wait at once, with
+`Stopped`. A pod that is not ready in time throws `NotReady`, which says what
+did not hold. Either way, the last lines of the log of each container go to the
+standard error.
+
+## Images
+
+```haskell
+-- an image of a registry, pinned by its digest: the same image for ever
+redisImage :: Image
+redisImage =
+  Registry
+    "docker.io/library/redis:7-alpine\
+    \@sha256:ec1c2d3603c3d7d65b153bedda0248b641aa3bd7684503406b27b9e870ac0796"
+
+-- an image built from a recipe that the tests carry
+nodeImage :: Image
+nodeImage =
+  Built
+    ImageSpec
+      { name = "regtest"
+      , containerfile = C.pack "FROM ...\nCOPY install.sh /\nRUN sh /install.sh\n"
+      , files = [("install.sh", installScript)]
+      }
+```
+
+A built image is tagged `localhost/NAME:HASH`, with a hash of the recipe and its
+files: a change of the recipe is a new image, and an old branch still finds its
+own. Pulling and building take a lock of the machine, so processes that start
+together wait for the first instead of doing the work again. Images are never
+removed by the library; `podman image prune` removes the old ones.
+
+## Parallel runs and clean-up
+
+Every process that uses the library is a run, named after its process ID and
+the start time of its process. Its pods are `pt-RUN-N-NAME`, its containers
+`pt-RUN-N-NAME-CONTAINER`, and its sockets are in its own folder:
+
+```
+$XDG_RUNTIME_DIR/podman-test/RUN/N/ENDPOINT.sock
+```
+
+So a test binary can run its tests in several threads, and a tool can run it as
+several processes at once, as
+[haskell-dev](https://github.com/jprupp/tools) does: nothing is shared. A pod is
+removed when its action ends. When a run is killed, its pods stay until the
+first pod of a later run removes them, with their folders. Nothing of a run
+whose process still exists is ever removed.
+
+## With hspec
+
+`podmanUsable` says whether Podman can run here, and why not, so that a machine
+without it runs the other tests and says what it left out:
+
+```haskell
+spec :: Spec
+spec = do
+  usable <- runIO podmanUsable
+  describe "Redis" $
+    it "answers PING" $ case usable of
+      Left why -> pendingWith why
+      Right () -> withContainer redis $ \p -> ...
+```
+
+Set `PODMAN_TEST_SKIP` to skip them on purpose. To share one pod between the
+tests of a group, use hspec's `aroundAll`:
+
+```haskell
+aroundAll (withContainer redis) $
+  it "answers PING" $ \p -> ...
+```
+
+## Requirements and limits
+
+- **Podman 4 or later, rootless, on Linux.** The user needs subordinate IDs
+  (`/etc/subuid` and `/etc/subgid`), as every rootless Podman does.
+- **SELinux** is fine: the folder of sockets is mounted with the shared label.
+- **macOS**: Podman runs its containers in a virtual machine, whose shared
+  folders do not carry sockets. Use `Published` endpoints there.
+- **Paths of sockets** are at most 107 bytes on Linux. The folder is short, but
+  a long name of an endpoint can still pass it; the library says so before it
+  starts anything.
+
+## Troubleshooting
+
+- **`podman info failed`**: rootless Podman is not set up for the user. Run
+  `podman info` to see why.
+- **A pod is not ready**: the logs of its containers are on the standard error.
+  `readyWithin` gives a slow service more time.
+- **Connection refused on a `Native` socket**: the service made it for its own
+  user only. Make it open to everyone, or use `Bridged`.
+- **Another folder for the sockets**: set `PODMAN_TEST_DIR`.
+- **What a run left**: `podman pod ps --filter label=podman-test.run`.
+
+## Module overview
+
+| Module | What it has |
+| --- | --- |
+| `Test.Podman` | pods, containers, endpoints, readiness, addresses: all that a test needs |
+| `Test.Podman.Image` | images of a registry and built images, pulled or built once |
+| `Test.Podman.Run` | the name and folder of a run, the clean-up of dead runs, locks of the machine |
+| `Test.Podman.Command` | running `podman` with a deadline, and `podmanUsable` |
+
+## Development
+
+```sh
+stack build
+stack test                 # runs real containers; pending without Podman
+```
+
+For the time between two commits there is a faster loop, `haskell-dev`, from
+[jprupp/tools](https://github.com/jprupp/tools), on your `PATH`:
+
+```sh
+haskell-dev build          # build without optimisation
+haskell-dev test           # the tests in several processes at once: 5 s
+haskell-dev docs           # build the documentation and check its comments
+```
+
+Do not mix the two kinds of build in one folder: the flags differ, so each
+switch compiles everything again. CI builds and tests every change with Stack,
+against the libraries of Ubuntu and with Nix, through the workflow that the
+Haskell packages of jprupp share. Format the code with `haskell-format`
+(ormolu). Changes are described in [CHANGELOG.md](CHANGELOG.md), and
+contributions are welcome as pull requests on GitHub.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
