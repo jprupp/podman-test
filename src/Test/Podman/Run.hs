@@ -59,7 +59,6 @@ import Control.Exception (SomeException, bracket, catch, evaluate, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Char (isDigit)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
-import Data.List (isPrefixOf)
 import Data.Map.Strict qualified as Map
 import GHC.IO.Handle.Lock (LockMode (..), hLock)
 import System.Directory
@@ -168,24 +167,22 @@ removeStale = do
 -- still runs.
 removeStaleRuns :: IO ()
 removeStaleRuns = do
+  -- the names of the pods of every run, and the run of each from the label:
+  -- podman pod ps writes labels differently from one version of Podman to
+  -- the next, but podman pod inspect keeps them in a map in every one
   pods <-
-    podman
-      [ "pod",
-        "ps",
-        "--filter",
-        "label=" <> runLabel,
-        "--format",
-        "{{.Name}} {{.Labels}}"
-      ]
-      `catch` \(_ :: SomeException) -> return ""
-  -- the name of each pod, then its labels as KEY=VALUE, apart by spaces
-  let key = runLabel <> "="
-  forM_ (map words (lines pods)) $ \case
-    pod : labels | name : _ <- [drop (length key) l | l <- labels, key `isPrefixOf` l] -> do
-      going <- alive name
-      unless going . void $
-        try @SomeException (podman ["pod", "rm", "--force", "--time", "0", pod])
-    _ -> return ()
+    lines
+      <$> podman ["pod", "ps", "--filter", "label=" <> runLabel, "--format", "{{.Name}}"]
+        `catch` \(_ :: SomeException) -> return []
+  forM_ pods $ \pod -> do
+    let labelOf = "{{index .Labels \"" <> runLabel <> "\"}}"
+    label <- try @SomeException (podman ["pod", "inspect", pod, "--format", labelOf])
+    case label of
+      Right name | not (null name) -> do
+        going <- alive name
+        unless going . void $
+          try @SomeException (podman ["pod", "rm", "--force", "--time", "0", pod])
+      _ -> return ()
   base <- baseFolder
   exists <- doesDirectoryExist base
   when exists $ do
