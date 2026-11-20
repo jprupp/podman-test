@@ -84,6 +84,10 @@
 --
 -- * Podman 4 or later, running rootless, on Linux. 'podmanUsable' says
 --   whether it can run, so that a test can be skipped where it cannot.
+-- * In a pure Nix shell, as @stack --nix@ makes one, the tests use the
+--   Podman of the machine, which is not on the @PATH@ there: it is found in
+--   the usual folders, or where @PODMAN_TEST_PODMAN@ says
+--   ("Test.Podman.Command").
 -- * A 'Native' socket is made by the service, as the user that it runs as in
 --   its container, which is not the user of the tests: the service must make
 --   it open to everyone, as Redis does with @--unixsocketperm 777@. Bridged
@@ -136,6 +140,7 @@ module Test.Podman
 
     -- * Podman
     podmanUsable,
+    podmanPath,
     podman,
     podmanWithin,
     PodmanError (..),
@@ -166,7 +171,7 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import System.Posix.Files (setFileMode)
-import Test.Podman.Command (PodmanError (..), podman, podmanStatus, podmanUsable, podmanWithin)
+import Test.Podman.Command (PodmanError (..), podman, podmanPath, podmanStatus, podmanUsable, podmanWithin)
 import Test.Podman.Image (Image (..), ImageSpec (..), ensureImage)
 import Test.Podman.Run (UnsafeFolder (..), nextNumber, removeStale, runFolder, runLabel, runName)
 

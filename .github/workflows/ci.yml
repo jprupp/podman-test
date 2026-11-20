@@ -5,8 +5,9 @@ name: CI
 # jprupp/tools: .github/workflows/haskell-stack.yml there says more.
 #
 # The runners of GitHub have Podman, so the tests run their containers there
-# too. Where Podman cannot run, as it may not in the shell of Nix, the tests
-# that need it are pending, and say why.
+# too, also in the pure shell of Nix, where the library finds the Podman of
+# the machine in /usr/bin. Where Podman cannot run, the tests that need it
+# are pending, and say why.
 
 on:
   push:

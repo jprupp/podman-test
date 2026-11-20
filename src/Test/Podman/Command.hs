@@ -24,6 +24,26 @@
 -- locked by a crashed process, or when a registry does not answer. So every
 -- call here gives up after a deadline, and throws a t'PodmanError' that says
 -- what it ran and what Podman printed.
+--
+-- = Which podman
+--
+-- The program is the one named by @PODMAN_TEST_PODMAN@, if it is set, or the
+-- first @podman@ on the @PATH@, or else the one of the machine: in
+-- @\/usr\/bin@, @\/usr\/local\/bin@, or @\/run\/current-system\/sw\/bin@
+-- on NixOS ('findPodman'). The last is for builds in a pure Nix shell, as
+-- @stack --nix@ makes them: the shell keeps the files of the machine but
+-- leaves only packages of Nix on the @PATH@, so the tests would not find
+-- the Podman that the machine has.
+--
+-- The machine's Podman cannot come from Nix: rootless Podman needs
+-- @newuidmap@ and @newgidmap@, which must be setuid, and nothing in the
+-- store of Nix can be. So it runs in an environment of its own
+-- ('podmanEnvironment'): the folders of the machine at the end of the
+-- @PATH@, where it finds those programs and its other helpers, NixOS's
+-- @\/run\/wrappers\/bin@ first among them, and no @LD_LIBRARY_PATH@ or
+-- @LD_PRELOAD@, which a shell of Nix may set, and which would make a
+-- program of the machine load libraries of Nix. The program is looked for
+-- once in a run.
 module Test.Podman.Command
   ( -- * Running podman
     podman,
@@ -33,16 +53,25 @@ module Test.Podman.Command
 
     -- * Whether podman can run
     podmanUsable,
+    podmanPath,
+
+    -- * Which podman
+    findPodman,
+    podmanEnvironment,
+    machineFolders,
   )
 where
 
 import Control.Exception (Exception, throwIO)
 import Data.Char (isSpace)
-import Data.List (dropWhileEnd)
-import System.Directory (findExecutable)
-import System.Environment (lookupEnv)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.List (dropWhileEnd, intercalate)
+import System.Directory (doesFileExist, executable, getPermissions)
+import System.Environment (getEnvironment, lookupEnv)
 import System.Exit (ExitCode (..))
-import System.Process (readProcessWithExitCode)
+import System.FilePath (searchPathSeparator, splitSearchPath, (</>))
+import System.IO.Unsafe (unsafePerformIO)
+import System.Process (CreateProcess (..), proc, readCreateProcessWithExitCode)
 import System.Timeout (timeout)
 
 -- | A call to @podman@ that failed or ran out of time, with what it was
@@ -52,6 +81,8 @@ data PodmanError
     PodmanFailed ![String] !Int !String
   | -- | it did not end within so many seconds
     PodmanTimedOut ![String] !Int
+  | -- | there is no podman to run, for this reason ('findPodman')
+    PodmanMissing !String
   deriving (Eq)
 
 instance Show PodmanError where
@@ -59,6 +90,7 @@ instance Show PodmanError where
     "podman " <> unwords args <> " exited with " <> show code <> ": " <> trim err
   show (PodmanTimedOut args secs) =
     "podman " <> unwords args <> " did not end within " <> show secs <> " seconds"
+  show (PodmanMissing why) = why
 
 instance Exception PodmanError
 
@@ -81,17 +113,86 @@ podmanWithin secs args =
 -- @podman image exists@. Throws only if it does not end in time.
 podmanStatus :: Int -> [String] -> IO (ExitCode, String, String)
 podmanStatus secs args =
-  timeout (secs * 1000000) (readProcessWithExitCode "podman" args "") >>= \case
-    Nothing -> throwIO (PodmanTimedOut args secs)
-    Just result -> return result
+  found >>= \case
+    Left why -> throwIO (PodmanMissing why)
+    Right (program, environment) -> do
+      let process = (proc program args) {env = Just environment}
+      timeout (secs * 1000000) (readCreateProcessWithExitCode process "") >>= \case
+        Nothing -> throwIO (PodmanTimedOut args secs)
+        Just result -> return result
+
+-- | The podman of this run and the environment to run it in, looked for at
+-- the first call and kept.
+found :: IO (Either String (FilePath, [(String, String)]))
+found =
+  readIORef foundRef >>= \case
+    Just r -> return r
+    Nothing -> do
+      environment <- getEnvironment
+      program <- findPodman environment
+      let r = (\path -> (path, podmanEnvironment environment)) <$> program
+      atomicModifyIORef' foundRef (\_ -> (Just r, r))
+
+foundRef :: IORef (Maybe (Either String (FilePath, [(String, String)])))
+foundRef = unsafePerformIO (newIORef Nothing)
+{-# NOINLINE foundRef #-}
+
+-- | The podman that the calls of this run use, if there is one.
+podmanPath :: IO (Maybe FilePath)
+podmanPath = either (const Nothing) (Just . fst) <$> found
+
+-- | The folders of the machine where its programs are, in the order in which
+-- they are looked in: NixOS's setuid wrappers and its system, then those
+-- of every other Linux.
+machineFolders :: [FilePath]
+machineFolders =
+  ["/run/wrappers/bin", "/run/current-system/sw/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+-- | Find the podman to run, in an environment: the program that
+-- @PODMAN_TEST_PODMAN@ names, if it is set; the first @podman@ on the
+-- @PATH@; or the first in the folders of the machine where Podman is
+-- installed. Gives why there is none, if there is none.
+findPodman :: [(String, String)] -> IO (Either String FilePath)
+findPodman environment = case lookup "PODMAN_TEST_PODMAN" environment of
+  Just named
+    | not (null named) ->
+        runnable named >>= \case
+          True -> return (Right named)
+          False -> return (Left ("PODMAN_TEST_PODMAN names " <> named <> ", which is not a program that can run"))
+  _ -> first (map (</> "podman") (onPath <> installed))
+  where
+    onPath = maybe [] splitSearchPath (lookup "PATH" environment)
+    installed = ["/usr/bin", "/usr/local/bin", "/run/current-system/sw/bin"]
+    first = \case
+      [] ->
+        return . Left $
+          "podman is not on the PATH, nor in "
+            <> intercalate ", " installed
+            <> ": install Podman, or name it with PODMAN_TEST_PODMAN"
+      p : ps -> runnable p >>= \ok -> if ok then return (Right p) else first ps
+    runnable p = do
+      exists <- doesFileExist p
+      if exists then executable <$> getPermissions p else return False
+
+-- | The environment to run podman in, from that of the tests: the folders of
+-- the machine at the end of the @PATH@, those that it does not have yet,
+-- so that podman finds @newuidmap@ and its other helpers where the machine
+-- has them; and no @LD_LIBRARY_PATH@ or @LD_PRELOAD@, which would make a
+-- program of the machine load the libraries of a shell of Nix.
+podmanEnvironment :: [(String, String)] -> [(String, String)]
+podmanEnvironment environment =
+  ("PATH", path) : [kv | kv@(k, _) <- environment, k `notElem` ["PATH", "LD_LIBRARY_PATH", "LD_PRELOAD"]]
+  where
+    current = maybe [] splitSearchPath (lookup "PATH" environment)
+    path = intercalate [searchPathSeparator] (current <> [d | d <- machineFolders, d `notElem` current])
 
 -- | Whether this machine can run the containers of the tests, and why not if
 -- it cannot: @Right ()@, or @Left@ a reason to show for the tests that are
 -- skipped.
 --
 -- It cannot when @PODMAN_TEST_SKIP@ is set, to any value, when there is no
--- @podman@ on the @PATH@, or when @podman info@ fails, as it does when the
--- user has no subordinate IDs for rootless containers. A test framework can
+-- podman to run ('findPodman'), or when @podman info@ fails, as it does
+-- when the user has no subordinate IDs for rootless containers. A test framework can
 -- mark the tests as pending with the reason, so that a machine without
 -- Podman runs the rest of the tests and says what it left out.
 podmanUsable :: IO (Either String ())
@@ -99,9 +200,9 @@ podmanUsable =
   lookupEnv "PODMAN_TEST_SKIP" >>= \case
     Just _ -> return (Left "PODMAN_TEST_SKIP is set")
     Nothing ->
-      findExecutable "podman" >>= \case
-        Nothing -> return (Left "podman is not on the PATH")
-        Just _ ->
+      found >>= \case
+        Left why -> return (Left why)
+        Right _ ->
           podmanStatus 60 ["info", "--format", "{{.Host.Arch}}"] >>= \case
             (ExitSuccess, _, _) -> return (Right ())
             (_, _, err) -> return (Left ("podman info failed: " <> trim err))

@@ -26,6 +26,7 @@ it is plain `IO`, in the shape of `bracket`.
 - [Parallel runs and clean-up](#parallel-runs-and-clean-up)
 - [With hspec](#with-hspec)
 - [Requirements and limits](#requirements-and-limits)
+- [Nix](#nix)
 - [Troubleshooting](#troubleshooting)
 - [Module overview](#module-overview)
 - [Development](#development)
@@ -263,6 +264,7 @@ aroundAll (withContainer redis) $
 - **Podman 4 or later, rootless, on Linux.** The user needs subordinate IDs
   (`/etc/subuid` and `/etc/subgid`), as every rootless Podman does.
 - **SELinux** is fine: the folder of sockets is mounted with the shared label.
+- **Nix builds** work: see [Nix](#nix).
 - **macOS**: Podman runs its containers in a virtual machine, whose shared
   folders do not carry sockets. Use `Published` endpoints there.
 - **Permissions.** Rootless Podman maps root of a container to you, and its
@@ -281,6 +283,8 @@ aroundAll (withContainer redis) $
 
 ## Troubleshooting
 
+- **`podman is not on the PATH, nor in …`**: there is no Podman where the
+  library looks. Install it, or name it with `PODMAN_TEST_PODMAN`.
 - **`podman info failed`**: rootless Podman is not set up for the user. Run
   `podman info` to see why.
 - **A pod is not ready**: the logs of its containers are on the standard error.
@@ -293,6 +297,24 @@ aroundAll (withContainer redis) $
   user made `/tmp/podman-test-UID` before you. Remove it, or choose another
   with `PODMAN_TEST_DIR`.
 - **What a run left**: `podman pod ps --filter label=podman-test.run`.
+
+## Nix
+
+`stack --nix` builds and tests in a pure Nix shell: it keeps the files of
+the machine, but leaves only packages of Nix on the `PATH`, so a test would
+not find the machine's Podman there. The machine's Podman is the one to use:
+rootless Podman needs `newuidmap` and `newgidmap`, which must be setuid, and
+nothing in the store of Nix can be.
+
+So the library looks for `podman` on the `PATH`, then in `/usr/bin`,
+`/usr/local/bin` and NixOS's `/run/current-system/sw/bin`, and
+`PODMAN_TEST_PODMAN` names another. It runs it with the folders of the
+machine at the end of its `PATH`, NixOS's setuid wrappers in
+`/run/wrappers/bin` first, so that Podman finds its helpers, and without
+`LD_LIBRARY_PATH` and `LD_PRELOAD`, so that a program of the machine does not
+load the libraries of the shell. Nothing has to change in `stack.yaml`:
+the tests run in the Nix job of CI as in the other. `podmanPath` says which
+Podman a run uses.
 
 ## Module overview
 

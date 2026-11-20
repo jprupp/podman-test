@@ -19,13 +19,19 @@ module Test.PodmanSpec (spec) where
 
 import Control.Concurrent.Async (mapConcurrently, replicateConcurrently)
 import Control.Exception (bracket, try)
-import Control.Monad (void)
+import Control.Monad (filterM, void)
 import Data.Bits ((.&.))
 import Data.ByteString.Char8 qualified as C
 import Data.List (isInfixOf, isPrefixOf, nub)
 import Network.Socket (close)
 import Network.Socket.ByteString (recv, sendAll)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removePathForcibly)
+import System.Directory
+  ( createDirectoryIfMissing,
+    doesDirectoryExist,
+    doesFileExist,
+    doesPathExist,
+    removePathForcibly,
+  )
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
@@ -34,7 +40,7 @@ import System.Posix.Types (FileMode)
 import System.Posix.User (getEffectiveUserID)
 import Test.Hspec
 import Test.Podman
-import Test.Podman.Command (podmanStatus)
+import Test.Podman.Command (findPodman, machineFolders, podmanEnvironment, podmanStatus)
 import Test.Podman.Image (ensureImage, imageReference)
 import Test.Podman.Run (baseFolder, privateFolder, removeStaleRuns, runFolder, runLabel)
 
@@ -252,11 +258,49 @@ spec = do
       outs <- mapConcurrently readIt [1 .. 3 :: Int]
       outs `shouldBe` replicate 3 "hello"
 
+  describe "which podman" $ do
+    it "runs podman with the folders of the machine on its PATH, and without the libraries of a shell" $ do
+      let environment =
+            [ ("PATH", "/nix/store/x/bin:/usr/bin"),
+              ("LD_LIBRARY_PATH", "/nix/store/y/lib"),
+              ("LD_PRELOAD", "z"),
+              ("HOME", "/h")
+            ]
+          adjusted = podmanEnvironment environment
+      lookup "LD_LIBRARY_PATH" adjusted `shouldBe` Nothing
+      lookup "LD_PRELOAD" adjusted `shouldBe` Nothing
+      lookup "HOME" adjusted `shouldBe` Just "/h"
+      let folders = maybe [] (splitOn ':') (lookup "PATH" adjusted)
+      take 2 folders `shouldBe` ["/nix/store/x/bin", "/usr/bin"]
+      filter (`elem` machineFolders) folders `shouldMatchList` machineFolders
+
+    podmanIt "finds the podman of the machine when the PATH has none, as in a pure shell of Nix" $ do
+      let installed = ["/usr/bin/podman", "/usr/local/bin/podman", "/run/current-system/sw/bin/podman"]
+      machine <- filterM doesFileExist installed
+      case machine of
+        [] -> pendingWith "this machine has no podman in its usual folders"
+        p : _ -> findPodman [("PATH", "/nix/store/none/bin")] `shouldReturn` Right p
+
+    it "takes the podman that PODMAN_TEST_PODMAN names, and refuses one that cannot run" $ do
+      sandbox <- (</> "which-test") <$> runFolder
+      createDirectoryIfMissing True sandbox
+      let fake = sandbox </> "my-podman"
+          missing = sandbox </> "no-podman"
+      writeFile fake "#!/bin/sh\n"
+      setFileMode fake 0o755
+      findPodman [("PODMAN_TEST_PODMAN", fake), ("PATH", "/nowhere")] `shouldReturn` Right fake
+      findPodman [("PODMAN_TEST_PODMAN", missing)] >>= \case
+        Left why -> why `shouldSatisfy` isInfixOf missing
+        Right p -> expectationFailure ("Took " <> p)
+
   describe "podmanUsable" $
     it "says why it cannot run when PODMAN_TEST_SKIP is set" $
       withSkip $
         podmanUsable `shouldReturn` Left "PODMAN_TEST_SKIP is set"
   where
+    splitOn c xs = case break (== c) xs of
+      (a, _ : rest) -> a : splitOn c rest
+      (a, []) -> [a]
     modeOf :: FilePath -> IO FileMode
     modeOf path = (.&. 0o777) . fileMode <$> getFileStatus path
     takeFolder = reverse . drop 1 . dropWhile (/= '/') . reverse

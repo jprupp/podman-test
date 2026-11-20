@@ -28,6 +28,12 @@ and this project adheres to the
   of the machine.
 - `podmanUsable`, to skip the tests where Podman cannot run, or when
   `PODMAN_TEST_SKIP` is set.
+- The Podman of the machine is found in a pure Nix shell, as `stack --nix`
+  makes one: in `/usr/bin`, `/usr/local/bin` or NixOS's
+  `/run/current-system/sw/bin` when it is not on the `PATH`, or where
+  `PODMAN_TEST_PODMAN` says. It runs with the folders of the machine on its
+  `PATH`, where it finds its setuid helpers, and without `LD_LIBRARY_PATH`
+  or `LD_PRELOAD`. `podmanPath` says which one a run uses.
 - The base folder of the sockets is private to the user: made with no
   access for anyone else, closed to others if they could use it, and
   refused with `UnsafeFolder` if it is a link or belongs to another user.
