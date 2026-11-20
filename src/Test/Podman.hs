@@ -36,6 +36,13 @@
 --   and a port. A 'Published' endpoint is published on a port of
 --   @127.0.0.1@ that Podman picks, and its 'Address' says which.
 --
+-- * __A bridge only where it is needed.__ The bridge is one more container,
+--   of one more image ('bridgeImage'). A pod has one when it has a 'Bridged'
+--   endpoint, or when it waits until a 'Published' endpoint accepts
+--   connections ('Accepts'). A pod of 'Native' and 'Published' endpoints
+--   that is ready by another 'Readiness' runs the containers of its spec and
+--   nothing else, so its tests need no image but their own.
+--
 -- * __Pods.__ The containers of a test are one pod: they share its network,
 --   so they reach each other on @localhost@, and its folder of sockets.
 --
@@ -283,7 +290,9 @@ data Readiness
   = -- | the endpoint of this name accepts connections. For a socket of the
     -- service, a connection from the tests is accepted; for a TCP port, one
     -- from inside the pod, so that a bridge or a port forwarder that
-    -- accepts before the service listens is not taken for the service.
+    -- accepts before the service listens is not taken for the service. The
+    -- connection from inside the pod is made by the bridge, so a pod that
+    -- waits this way for a 'Published' endpoint has a bridge.
     Accepts !String
   | -- | the log of this container has this text
     LogLine !String !String
@@ -298,7 +307,9 @@ instance Show Readiness where
   show (Succeeds c cmd) = unwords cmd <> " succeeds in " <> c
   show (Probe what _) = what
 
--- | The image of the bridges, pinned by its digest: socat on Alpine.
+-- | The image of the bridges, pinned by its digest: socat on Alpine. It is
+-- pulled for the first pod that needs a bridge, and a pod that needs none
+-- never asks for it.
 bridgeImage :: Image
 bridgeImage =
   Registry
@@ -343,8 +354,8 @@ instance Exception PodError
 --
 -- The images are pulled or built if they are not there, which only the
 -- first test of the machine waits for. Then the pod is made, its containers
--- started, a bridge started for its 'Bridged' endpoints, and every
--- 'Readiness' of its spec checked. If the pod is not ready in time, or the
+-- started, a bridge started if the pod needs one, and every 'Readiness' of
+-- its spec checked. If the pod is not ready in time, or the
 -- action throws, the last lines of the log of each container go to the
 -- standard error before the pod is removed.
 withPod :: PodSpec -> (Pod -> IO a) -> IO a
@@ -356,7 +367,10 @@ withPod spec act = do
   let full = "pt-" <> runName <> "-" <> show n <> "-" <> spec.name
       dir = run </> show n
       eps = concatMap (.endpoints) spec.containers
-      needsBridge = any (not . isNative) eps
+      -- the bridge makes the sockets of the bridged endpoints, and is where
+      -- a published port is tried from inside the pod
+      awaited = [endpoint | Accepts endpoint <- spec.ready]
+      needsBridge = any isBridged eps || or [endpointName e `elem` awaited | e <- eps, isPublished e]
   case [p | e <- eps, not (isPublished e), let p = dir </> (endpointName e <> ".sock"), length p > 107] of
     p : _ ->
       throwIO . BadSpec $
@@ -400,9 +414,9 @@ check spec
     badName what n = Left ("the " <> what <> " name " <> show n <> " is not lowercase letters, digits and dashes")
     dups xs = [x | x <- nub xs, length (filter (== x) xs) > 1]
 
-isNative :: Endpoint -> Bool
-isNative = \case
-  Native _ -> True
+isBridged :: Endpoint -> Bool
+isBridged = \case
+  Bridged _ _ -> True
   _ -> False
 
 isPublished :: Endpoint -> Bool
@@ -464,8 +478,9 @@ start full dir c ref =
 -- | Start the bridge of a pod: a socat for each 'Bridged' endpoint, which
 -- makes the socket and joins each connection to it to the port of the
 -- service. It runs as root of its container, which is the user of the tests
--- on the host, so the sockets are theirs. It stays even without a 'Bridged'
--- endpoint, to check 'Published' ones from inside the pod.
+-- on the host, so the sockets are theirs. A pod without a 'Bridged' endpoint
+-- has one too when it waits for a 'Published' endpoint to accept
+-- connections: the bridge is where that port is tried from inside the pod.
 startBridge :: String -> FilePath -> [Endpoint] -> String -> IO ()
 startBridge full dir eps ref =
   void . podman $
@@ -478,13 +493,17 @@ startBridge full dir eps ref =
         ]
         <> "while :; do sleep 3600; done"
 
--- | The address of an endpoint of a pod that runs.
+-- | The address of an endpoint of a pod that runs. The ports of a pod are
+-- published by the pod itself, so the port of a 'Published' endpoint is
+-- asked of the container that Podman keeps for the network of the pod: it
+-- runs for as long as the pod, whatever its other containers do.
 addressOf :: String -> FilePath -> Endpoint -> IO Address
 addressOf full dir = \case
   Native n -> return (UnixSocket (dir </> (n <> ".sock")))
   Bridged n _ -> return (UnixSocket (dir </> (n <> ".sock")))
   Published _ p -> do
-    out <- podman ["port", full <> "-" <> "bridge", show p <> "/tcp"]
+    infra <- podman ["pod", "inspect", full, "--format", "{{.InfraContainerID}}"]
+    out <- podman ["port", infra, show p <> "/tcp"]
     case reverse (takeWhile (/= ':') (reverse (headOr "" (lines out)))) of
       digits | not (null digits), all isDigit digits -> return (TcpPort "127.0.0.1" (read digits))
       _ -> throwIO (BadSpec ("Podman published port " <> show p <> " nowhere: " <> out))

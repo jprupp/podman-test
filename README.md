@@ -61,7 +61,8 @@ place of ports, and with no helper container left running to clean up.
   endpoints are all sockets has no network at all.
 - **A bridge for services that only speak TCP.** A small container of
   [socat](http://www.dest-unreach.org/socat/) in the pod joins each connection
-  to a socket to the port of the service, which needs nothing installed.
+  to a socket to the port of the service, which needs nothing installed. A pod
+  that needs no bridge runs none: see [Endpoints](#endpoints).
 - **TCP where a client needs it.** A port can still be published on
   `127.0.0.1`, on a port that Podman picks, for a client that only takes a host
   and a port.
@@ -152,6 +153,14 @@ which rootless Podman maps to the user of the tests, so the socket is theirs.
 **Published** is for clients that only take a host and a port. The pod then
 has a network, which it does not need otherwise.
 
+**The bridge** is one more container in the pod, of one more image: socat on
+Alpine, pulled from Docker Hub by its digest. A pod has one in two cases: it
+has a `Bridged` endpoint, or it waits until a `Published` endpoint accepts
+connections, which is what `pod` asks for every endpoint. A pod of `Native`
+and `Published` endpoints that is ready by something else, such as `Succeeds`
+or `LogLine`, runs the containers of its spec and nothing else. Tests that
+must pull no image at all use such a pod, with images that the machine has.
+
 ## Pods of several containers
 
 The containers of a pod share its network, so they reach each other on
@@ -182,7 +191,7 @@ in their order, within `readyWithin` seconds, 60 by default. `pod` sets
 
 | Readiness | Holds when |
 | --- | --- |
-| `Accepts "db"` | the endpoint accepts a connection; for a port, from inside the pod, so that a bridge that accepts before the service listens does not count |
+| `Accepts "db"` | the endpoint accepts a connection; for a port, from inside the pod, through the bridge, so that a bridge or a port forwarder that accepts before the service listens does not count |
 | `LogLine "db" "ready to accept"` | the log of the container has the text |
 | `Succeeds "db" ["pg_isready"]` | the command succeeds in the container |
 | `Probe "the schema is loaded" check` | `check :: Pod -> IO Bool` says so |
@@ -212,6 +221,12 @@ nodeImage =
       , files = [("install.sh", installScript)]
       }
 ```
+
+An image that the machine has already, such as one that a script of the
+package built, is named like one of a registry, by its reference:
+`Registry "localhost/NAME:TAG"`. Podman has it, so nothing is pulled. When it
+is missing, the pull fails and so does the pod: check with
+`podman image exists` first to skip the tests instead.
 
 A built image is tagged `localhost/NAME:HASH`, with a hash of the recipe and its
 files: a change of the recipe is a new image, and an old branch still finds its

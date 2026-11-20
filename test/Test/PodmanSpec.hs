@@ -8,6 +8,7 @@
 --
 -- Tests of the library against Podman: Redis, pinned by its digest, in pods
 -- reached through a socket of its own, through a bridge and through a port;
+-- a pod that needs no bridge and runs none;
 -- two containers of a pod that talk on @localhost@; eight pods at once;
 -- containers that stop, pods that are never ready, stale runs, specs that
 -- cannot run, and images built by several processes at once.
@@ -87,6 +88,10 @@ ping a = bracket (connectTo a) close $ \s -> do
 podExists :: String -> IO Bool
 podExists n = (\(code, _, _) -> code == ExitSuccess) <$> podmanStatus 60 ["pod", "exists", n]
 
+-- | Whether Podman has a container of this name.
+containerExists :: String -> IO Bool
+containerExists n = (\(code, _, _) -> code == ExitSuccess) <$> podmanStatus 60 ["container", "exists", n]
+
 spec :: Spec
 spec = do
   usable <- runIO podmanUsable
@@ -125,6 +130,14 @@ spec = do
             port `shouldSatisfy` (> 0)
           UnixSocket _ -> expectationFailure "Not a port"
         ping a `shouldReturn` "+PONG\r\n"
+
+    podmanIt "runs no bridge in a pod of published ports that is ready by a command of its own" $ do
+      let published = redisTcp {endpoints = [Published "redis" 6379]}
+          byCommand = (pod "plain" [published]) {ready = [Succeeds "redis" ["redis-cli", "ping"]]}
+      withPod byCommand $ \p -> do
+        containerExists (containerName p "redis") `shouldReturn` True
+        containerExists (containerName p "bridge") `shouldReturn` False
+        ping (address p "redis") `shouldReturn` "+PONG\r\n"
 
   describe "pods" $ do
     podmanIt "lets the containers of a pod reach each other on localhost" $ do

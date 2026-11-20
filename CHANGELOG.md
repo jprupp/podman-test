@@ -17,7 +17,9 @@ and this project adheres to the
 - Endpoints of three kinds: a Unix socket of the service (`Native`), a TCP
   port bridged to a Unix socket by a container of socat (`Bridged`), and a
   TCP port published on a port of `127.0.0.1` that Podman picks
-  (`Published`). A pod with sockets only has no network.
+  (`Published`). A pod with sockets only has no network. The container of
+  socat runs only in a pod that needs it: one with a `Bridged` endpoint, or
+  one that waits for a `Published` endpoint to accept connections.
 - Readiness: an endpoint accepts connections, a line in a log, a command
   that succeeds in a container, or a check of your own, within a deadline.
 - Every run has its own pods and its own folder of sockets, so test
