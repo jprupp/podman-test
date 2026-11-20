@@ -54,7 +54,10 @@ import Test.Podman.Run (nextNumber, runFolder, withLock)
 -- | The image of a container.
 data Image
   = -- | an image of a registry, by its full reference, best pinned by its
-    -- digest: @docker.io\/library\/redis:7-alpine\@sha256:…@
+    -- digest: @docker.io\/library\/redis:7-alpine\@sha256:…@. An image that
+    -- the machine has already, such as one that a script built, is named
+    -- the same way, as @localhost\/NAME:TAG@: nothing is pulled when Podman
+    -- has the image.
     Registry !String
   | -- | an image built from a recipe
     Built !ImageSpec
