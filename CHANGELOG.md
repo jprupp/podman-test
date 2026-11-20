@@ -28,6 +28,12 @@ and this project adheres to the
   of the machine.
 - `podmanUsable`, to skip the tests where Podman cannot run, or when
   `PODMAN_TEST_SKIP` is set.
+- The base folder of the sockets is private to the user: made with no
+  access for anyone else, closed to others if they could use it, and
+  refused with `UnsafeFolder` if it is a link or belongs to another user.
+  The folders of the pods, and native sockets, are open to everyone, for
+  services that run as another user in their containers, so this folder is
+  what keeps the other users of the machine out.
 - The last lines of the log of every container on the standard error when a
   pod is not ready or the action fails.
 

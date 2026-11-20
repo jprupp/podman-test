@@ -20,21 +20,23 @@ module Test.PodmanSpec (spec) where
 import Control.Concurrent.Async (mapConcurrently, replicateConcurrently)
 import Control.Exception (bracket, try)
 import Control.Monad (void)
+import Data.Bits ((.&.))
 import Data.ByteString.Char8 qualified as C
 import Data.List (isInfixOf, isPrefixOf, nub)
 import Network.Socket (close)
 import Network.Socket.ByteString (recv, sendAll)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesPathExist, removePathForcibly)
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.Posix.Files (fileOwner, getFileStatus)
+import System.Posix.Files (createSymbolicLink, fileMode, fileOwner, getFileStatus, setFileMode)
+import System.Posix.Types (FileMode)
 import System.Posix.User (getEffectiveUserID)
 import Test.Hspec
 import Test.Podman
 import Test.Podman.Command (podmanStatus)
-import Test.Podman.Image (imageReference)
-import Test.Podman.Run (baseFolder, removeStaleRuns, runFolder, runLabel)
+import Test.Podman.Image (ensureImage, imageReference)
+import Test.Podman.Run (baseFolder, privateFolder, removeStaleRuns, runFolder, runLabel)
 
 -- | Redis, pinned by its digest.
 redisImage :: Image
@@ -185,6 +187,41 @@ spec = do
       doesPathExist (base </> dead) `shouldReturn` False
       doesDirectoryExist mine `shouldReturn` True
 
+  describe "private folders" $ do
+    it "makes a missing folder for the user alone, and closes one of the user's to others" $ do
+      sandbox <- (</> "private-test") <$> runFolder
+      createDirectoryIfMissing True sandbox
+      let fresh = sandbox </> "fresh"
+          open = sandbox </> "open"
+      privateFolder fresh
+      modeOf fresh `shouldReturn` 0o700
+      createDirectoryIfMissing True open
+      setFileMode open 0o755
+      privateFolder open
+      modeOf open `shouldReturn` 0o700
+
+    it "refuses a link and a file in place of the folder" $ do
+      sandbox <- (</> "private-test") <$> runFolder
+      createDirectoryIfMissing True (sandbox </> "target")
+      let link = sandbox </> "link"
+          file = sandbox </> "file"
+      removePathForcibly link
+      createSymbolicLink (sandbox </> "target") link
+      privateFolder link `shouldThrow` \(UnsafeFolder _ why) -> "link" `isInfixOf` why
+      writeFile file ""
+      privateFolder file `shouldThrow` \(UnsafeFolder _ why) -> "not a folder" `isInfixOf` why
+
+    podmanIt "refuses a folder of another user" $ do
+      -- root of a container is the user of the tests; another user of the
+      -- container is a subordinate ID on the host, so a folder that root of
+      -- the container gives to one belongs to another user of the machine
+      sandbox <- (</> "private-test") <$> runFolder
+      createDirectoryIfMissing True sandbox
+      ref <- ensureImage redisImage
+      let script = "mkdir -p /x/theirs && chown 999:999 /x/theirs"
+      void $ podman ["run", "--rm", "--volume", sandbox <> ":/x:z", "--entrypoint", "sh", ref, "-c", script]
+      privateFolder (sandbox </> "theirs") `shouldThrow` \(UnsafeFolder _ why) -> "another user" `isInfixOf` why
+
   describe "images" $ do
     it "names a built image by the hash of its recipe" $ do
       let recipe = ImageSpec {name = "Echo Test", containerfile = C.pack "FROM scratch\n", files = []}
@@ -220,6 +257,8 @@ spec = do
       withSkip $
         podmanUsable `shouldReturn` Left "PODMAN_TEST_SKIP is set"
   where
+    modeOf :: FilePath -> IO FileMode
+    modeOf path = (.&. 0o777) . fileMode <$> getFileStatus path
     takeFolder = reverse . drop 1 . dropWhile (/= '/') . reverse
     isSuffixOf' s x = reverse s `isPrefixOf` reverse x
     withSkip act = bracket (setEnv "PODMAN_TEST_SKIP" "1") (const (unsetEnv "PODMAN_TEST_SKIP")) (const act)

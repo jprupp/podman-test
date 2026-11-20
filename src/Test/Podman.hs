@@ -88,6 +88,9 @@
 --   its container, which is not the user of the tests: the service must make
 --   it open to everyone, as Redis does with @--unixsocketperm 777@. Bridged
 --   sockets are made by the bridge, as the user of the tests.
+-- * The folders of the pods are open to everyone, for those services, under
+--   a base folder that is the user's alone: one that another user made, or a
+--   link, is refused with t'UnsafeFolder'.
 -- * On macOS, Podman runs its containers in a virtual machine, whose shared
 --   folders do not carry sockets: use 'Published' endpoints there.
 module Test.Podman
@@ -129,6 +132,7 @@ module Test.Podman
 
     -- * Errors
     PodError (..),
+    UnsafeFolder (..),
 
     -- * Podman
     podmanUsable,
@@ -164,7 +168,7 @@ import System.IO (hPutStrLn, stderr)
 import System.Posix.Files (setFileMode)
 import Test.Podman.Command (PodmanError (..), podman, podmanStatus, podmanUsable, podmanWithin)
 import Test.Podman.Image (Image (..), ImageSpec (..), ensureImage)
-import Test.Podman.Run (nextNumber, removeStale, runFolder, runLabel, runName)
+import Test.Podman.Run (UnsafeFolder (..), nextNumber, removeStale, runFolder, runLabel, runName)
 
 -------------------------------------------------------------------------------
 -- Specs
@@ -403,8 +407,9 @@ isPublished = \case
 
 -- | Make the folder of a pod and the pod. The folder is open to everyone, so
 -- that a service that runs as another user than the tests can make its
--- socket in it; it is in the folder of the run, which only the user of the
--- tests can enter.
+-- socket in it; it is in the folder of the run, under the base folder,
+-- which is the user's alone ('Test.Podman.Run.privateFolder'), so no other
+-- user of the machine can enter it.
 create :: String -> FilePath -> [Endpoint] -> IO ()
 create full dir eps =
   bracketOnError (createDirectory dir >> setFileMode dir 0o777) (const (remove full dir)) $ \_ -> do

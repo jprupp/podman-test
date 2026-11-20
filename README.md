@@ -265,6 +265,16 @@ aroundAll (withContainer redis) $
 - **SELinux** is fine: the folder of sockets is mounted with the shared label.
 - **macOS**: Podman runs its containers in a virtual machine, whose shared
   folders do not carry sockets. Use `Published` endpoints there.
+- **Permissions.** Rootless Podman maps root of a container to you, and its
+  other users to subordinate IDs that are not you. A bridged socket is made
+  by root of the bridge, so it is yours. A native socket is made by the
+  service as its own user, so it must be open to everyone, and the folder of
+  each pod is open to everyone so that the service can make it there. Other
+  users of the machine are kept out by the base folder above them all,
+  which is yours alone: made with no access for anyone else, and refused,
+  with `UnsafeFolder`, if another user made it first or it is a link. That
+  matters for `/tmp/podman-test-UID` and for `PODMAN_TEST_DIR`; the default,
+  under `$XDG_RUNTIME_DIR`, is private already.
 - **Paths of sockets** are at most 107 bytes on Linux. The folder is short, but
   a long name of an endpoint can still pass it; the library says so before it
   starts anything.
@@ -277,7 +287,11 @@ aroundAll (withContainer redis) $
   `readyWithin` gives a slow service more time.
 - **Connection refused on a `Native` socket**: the service made it for its own
   user only. Make it open to everyone, or use `Bridged`.
-- **Another folder for the sockets**: set `PODMAN_TEST_DIR`.
+- **Another folder for the sockets**: set `PODMAN_TEST_DIR`. It is made
+  private to you, and refused if it belongs to someone else.
+- **`UnsafeFolder`**: the base folder is not yours alone, as when another
+  user made `/tmp/podman-test-UID` before you. Remove it, or choose another
+  with `PODMAN_TEST_DIR`.
 - **What a run left**: `podman pod ps --filter label=podman-test.run`.
 
 ## Module overview

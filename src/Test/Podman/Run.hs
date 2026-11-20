@@ -37,11 +37,28 @@
 -- Linux, so the folder has to be short: @$XDG_RUNTIME_DIR\/podman-test@,
 -- which is in memory and private to the user, or @\/tmp\/podman-test-UID@
 -- where there is no runtime folder. @PODMAN_TEST_DIR@ chooses another.
+--
+-- = Private to the user
+--
+-- The folder of each pod is open to everyone, so that a service that runs
+-- as another user in its container can make its socket there, and such a
+-- socket is open to everyone, so that the tests can connect to it. What
+-- keeps other users of the machine out is the folder above them all, which
+-- must be the user's alone ('privateFolder'): made with no access for
+-- anyone else, and refused if it is not a folder of the user, as when
+-- another user made @\/tmp\/podman-test-UID@ first, or put a link to a
+-- folder of theirs there. A folder of the user that others may read is
+-- closed to them. Without that, another user could reach the services of
+-- the tests, which have no password, or put files in the folders of their
+-- sockets.
 module Test.Podman.Run
   ( -- * The run
     runName,
     runFolder,
     baseFolder,
+    privateBase,
+    privateFolder,
+    UnsafeFolder (..),
     nextNumber,
     runLabel,
 
@@ -55,8 +72,9 @@ module Test.Podman.Run
 where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
-import Control.Exception (SomeException, bracket, catch, evaluate, try)
+import Control.Exception (Exception, SomeException, bracket, catch, evaluate, throwIO, try)
 import Control.Monad (forM_, unless, void, when)
+import Data.Bits ((.&.))
 import Data.Char (isDigit)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Map.Strict qualified as Map
@@ -68,10 +86,19 @@ import System.Directory
     removeDirectoryRecursive,
   )
 import System.Environment (lookupEnv)
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.IO (IOMode (..), hClose, openFile)
+import System.IO.Error (isAlreadyExistsError)
 import System.IO.Unsafe (unsafePerformIO)
-import System.Posix.Files (setFileMode)
+import System.Posix.Directory (createDirectory)
+import System.Posix.Files
+  ( fileMode,
+    fileOwner,
+    getSymbolicLinkStatus,
+    isDirectory,
+    isSymbolicLink,
+    setFileMode,
+  )
 import System.Posix.Process (getProcessID)
 import System.Posix.User (getEffectiveUserID)
 import Test.Podman.Command (podman)
@@ -134,11 +161,53 @@ baseFolder =
         Just dir | not (null dir) -> return (dir </> "podman-test")
         _ -> ("/tmp/podman-test-" <>) . show <$> getEffectiveUserID
 
--- | The folder of this run, made if it is not there.
+-- | 'baseFolder', made private to the user ('privateFolder').
+privateBase :: IO FilePath
+privateBase = do
+  dir <- baseFolder
+  privateFolder dir
+  return dir
+
+-- | A folder that cannot be made private to the user, and why.
+data UnsafeFolder = UnsafeFolder !FilePath !String
+  deriving (Eq)
+
+instance Show UnsafeFolder where
+  show (UnsafeFolder path why) =
+    "The folder "
+      <> path
+      <> " of podman-test is not private to this user: "
+      <> why
+      <> ". Remove it, or choose another with PODMAN_TEST_DIR."
+
+instance Exception UnsafeFolder
+
+-- | Make sure that a folder is the user's alone: make it, with its parents,
+-- with no access for anyone else if it is not there; take away the access
+-- of others if it is a folder of the user's that others may use; and throw
+-- t'UnsafeFolder' if it is a link, not a folder, or a folder of another
+-- user, none of which the user can trust.
+privateFolder :: FilePath -> IO ()
+privateFolder dir = do
+  createDirectoryIfMissing True (takeDirectory dir)
+  made <- try (createDirectory dir 0o700)
+  case made of
+    Left e | not (isAlreadyExistsError e) -> ioError e
+    _ -> return ()
+  st <- getSymbolicLinkStatus dir
+  me <- getEffectiveUserID
+  when (isSymbolicLink st) $ throwIO (UnsafeFolder dir "it is a symbolic link")
+  unless (isDirectory st) $ throwIO (UnsafeFolder dir "it is not a folder")
+  when (fileOwner st /= me) $
+    throwIO (UnsafeFolder dir ("it belongs to another user, of UID " <> show (fileOwner st)))
+  when (fileMode st .&. 0o077 /= 0) $ setFileMode dir 0o700
+
+-- | The folder of this run, made if it is not there, in the private base
+-- folder.
 runFolder :: IO FilePath
 runFolder = do
-  dir <- (</> runName) <$> baseFolder
-  createDirectoryIfMissing True dir
+  dir <- (</> runName) <$> privateBase
+  createDirectoryIfMissing False dir
   return dir
 
 counter :: IORef Int
@@ -183,7 +252,7 @@ removeStaleRuns = do
         unless going . void $
           try @SomeException (podman ["pod", "rm", "--force", "--time", "0", pod])
       _ -> return ()
-  base <- baseFolder
+  base <- privateBase
   exists <- doesDirectoryExist base
   when exists $ do
     names <- listDirectory base
@@ -206,10 +275,8 @@ withLock name act = do
     Just old -> (m, old)
     Nothing -> (Map.insert name fresh m, fresh)
   withMVar turn $ \_ -> do
-    dir <- (</> "locks") <$> baseFolder
-    createDirectoryIfMissing True dir
-    -- the folder is shared by every run of the user, and private to them
-    void $ try @SomeException (setFileMode dir 0o700)
+    dir <- (</> "locks") <$> privateBase
+    createDirectoryIfMissing False dir
     bracket (openFile (dir </> name) ReadWriteMode) hClose $ \h -> do
       hLock h ExclusiveLock
       act
